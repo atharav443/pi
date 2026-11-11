@@ -4,6 +4,8 @@ import { join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { getAgentDir } from "../../src/config.ts";
+import { readAbortLog } from "../../src/core/abort-log.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -212,6 +214,49 @@ describe("AgentSessionRuntime characterization", () => {
 			"toolResult",
 			"assistant",
 		]);
+	});
+
+	it("labels replacement and quit aborts with their lifecycle reason", async () => {
+		const toolStartWaiters: Array<() => void> = [];
+		const nextToolStart = (): Promise<void> =>
+			new Promise<void>((resolve) => {
+				toolStartWaiters.push(resolve);
+			});
+		const { runtime, faux } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.registerTool({
+				name: "block",
+				label: "Block",
+				description: "Blocks until aborted",
+				parameters: Type.Object({}),
+				execute: (_toolCallId, _params, signal) =>
+					new Promise<AgentToolResult<unknown>>((resolve) => {
+						toolStartWaiters.shift()?.();
+						signal?.addEventListener("abort", () => resolve({ content: [], details: {} }));
+					}),
+			});
+		});
+		const logPath = join(getAgentDir(), "aborts.json");
+		const recordsBefore = readAbortLog(logPath).length;
+
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
+		const outgoingSession = runtime.session;
+		const firstStarted = nextToolStart();
+		const firstPrompt = outgoingSession.prompt("start blocking tool");
+		await firstStarted;
+		await runtime.newSession();
+		await firstPrompt;
+
+		await runtime.session.bindExtensions({});
+		faux.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
+		const secondStarted = nextToolStart();
+		const secondPrompt = runtime.session.prompt("start blocking tool again");
+		await secondStarted;
+		await runtime.dispose();
+		await secondPrompt;
+
+		const records = readAbortLog(logPath).slice(recordsBefore);
+		expect(records.map((record) => record.reason)).toEqual(["session.new", "session.quit"]);
+		expect(records.map((record) => record.scope)).toEqual(["agent_request", "agent_request"]);
 	});
 
 	// #11060

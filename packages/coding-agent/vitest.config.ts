@@ -8,6 +8,8 @@ export default mergeConfig(
 			globals: true,
 			environment: "node",
 			testTimeout: 30000,
+			// Isolates PI_CODING_AGENT_DIR per test file so no test writes the user's abort log.
+			setupFiles: ["test/setup-abort-log.ts"],
 			// Tests run offline by default; opt in with allowNetwork() from test/test-network-env.ts.
 			env: { PI_OFFLINE: "1" },
 			unstubEnvs: true,

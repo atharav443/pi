@@ -16,6 +16,7 @@
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
+	type AbortProvenance,
 	type AfterToolCallContext,
 	type AfterToolCallResult,
 	type Agent,
@@ -27,6 +28,8 @@ import {
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	captureAbortCaller,
+	normalizeAbortReason,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type StreamFn,
@@ -57,11 +60,13 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { VERSION } from "../config.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
+import { type AbortRecord, recordAbort } from "./abort-log.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
@@ -406,6 +411,9 @@ function getNextCycleIndex(
 	return direction === "forward" ? (currentIndex + 1) % length : (currentIndex - 1 + length) % length;
 }
 
+/** Abort provenance captured at an `AgentSession` entry point, before the low-level abort. */
+type AbortCapture = { reason?: string; caller: readonly string[]; timestamp: string };
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -419,6 +427,13 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
+	/** Full UUID of the current logical run; abort records correlate on it. */
+	private _runId: string = globalThis.crypto.randomUUID();
+	/** Whether the current logical run already has its one abort record. */
+	private _abortRecordedForRun = false;
+	/** Outer abort provenance, set only around the synchronous low-level abort it causes. */
+	private _pendingAbort?: AbortCapture;
+	private _unsubscribeAbortObserver?: () => void;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -546,6 +561,9 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._unsubscribeAbortObserver = this.agent.addAbortObserver((provenance) =>
+			this._handleAbortProvenance(provenance),
+		);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 		this._installAgentRequestProjection();
@@ -1477,14 +1495,29 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		const capture: AbortCapture = {
+			reason: "session.dispose",
+			caller: captureAbortCaller(AgentSession.prototype.dispose),
+			timestamp: new Date().toISOString(),
+		};
+		// The low-level abort notifies the observer synchronously, so disposal carries its own
+		// provenance the same way an explicit abort does.
+		this._pendingAbort = capture;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
-			this.agent.abort();
+			this.agent.abort(capture.reason);
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
+		} finally {
+			// Only an actual low-level cancellation was recorded. Disposal does not cancel a run that
+			// has not reached the agent yet, so it writes no record for one.
+			this._pendingAbort = undefined;
+			// After the abort, so a cancellation during disposal is still observed.
+			this._unsubscribeAbortObserver?.();
+			this._unsubscribeAbortObserver = undefined;
 		}
 
 		this._extensionRunner.invalidate(
@@ -1954,6 +1987,8 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		this._runId = globalThis.crypto.randomUUID();
+		this._abortRecordedForRun = false;
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
@@ -2610,8 +2645,11 @@ export class AgentSession {
 
 	/**
 	 * Abort current operation and wait for agent to become idle.
+	 *
+	 * @param reason Machine token recorded in the abort log, such as "user" or "rpc". It is
+	 * diagnostics only: it never reaches the provider, the transcript or the abort signal's reason.
 	 */
-	async abort(): Promise<void> {
+	async abort(reason = "sdk"): Promise<void> {
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
@@ -2619,8 +2657,70 @@ export class AgentSession {
 		this.abortCompaction();
 		this.abortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
-		this.agent.abort();
+		const capture: AbortCapture = {
+			reason: normalizeAbortReason(reason),
+			caller: captureAbortCaller(AgentSession.prototype.abort),
+			timestamp: new Date().toISOString(),
+		};
+		// The low-level abort notifies observers synchronously; they read this outer capture instead
+		// of attributing the abort to this method's own frame.
+		this._pendingAbort = capture;
+		try {
+			this.agent.abort(capture.reason);
+		} finally {
+			this._pendingAbort = undefined;
+		}
+		// No live low-level request was there to observe: the run is starting, between requests,
+		// or settling. Record it once for the logical run.
+		if (this._isAgentRunActive && !this._abortRecordedForRun) {
+			this._abortRecordedForRun = true;
+			this._recordAbort(this._isBeforeSettle ? "before_settle" : "between_requests", capture);
+		}
 		await this.waitForIdle();
+	}
+
+	/** Handle the low-level agent's first abort of a live run. */
+	private _handleAbortProvenance(provenance: AbortProvenance): void {
+		if (this._isAgentRunActive) {
+			// A session entry point already recorded this logical run; an internal low-level abort that
+			// follows, such as the one an abort requested during before_agent_start triggers at
+			// agent_start, must not duplicate or relabel that record.
+			if (this._abortRecordedForRun) return;
+			this._abortRecordedForRun = true;
+		} else {
+			// Outside a logical session run, the abort belongs to a direct Agent run whose own id is the
+			// only honest identity; the session's last run id would be stale.
+			this._runId = provenance.runId;
+		}
+		const capture = this._pendingAbort ?? {
+			reason: provenance.reason,
+			caller: provenance.caller,
+			timestamp: provenance.timestamp,
+		};
+		this._recordAbort("agent_request", capture, provenance.runId);
+	}
+
+	/**
+	 * Write one abort record for the current logical run. Diagnostics are best effort: `recordAbort`
+	 * never throws, and nothing here may stop the cancellation that produced the record.
+	 */
+	private _recordAbort(scope: AbortRecord["scope"], capture: AbortCapture, requestRunId?: string): void {
+		const sessionFile = this.sessionManager.getSessionFile();
+		const sessionLeafId = this.sessionManager.getLeafId();
+		recordAbort({
+			timestamp: capture.timestamp,
+			runId: this._runId,
+			...(requestRunId === undefined ? {} : { requestRunId }),
+			scope,
+			...(capture.reason === undefined ? {} : { reason: capture.reason }),
+			caller: capture.caller,
+			version: VERSION,
+			sessionId: this.sessionManager.getSessionId(),
+			...(sessionFile === undefined ? {} : { sessionFile }),
+			...(sessionLeafId === null ? {} : { sessionLeafId }),
+			cwd: this._cwd,
+			pid: process.pid,
+		});
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -2934,7 +3034,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
+		await this.abort("compaction");
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -3612,7 +3712,7 @@ export class AgentSession {
 						this._extensionAbortHandler();
 						return;
 					}
-					void this.abort();
+					void this.abort("extension");
 				},
 				hasPendingMessages: () => this.pendingMessageCount > 0,
 				shutdown: () => {

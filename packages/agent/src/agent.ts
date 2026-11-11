@@ -12,6 +12,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
+import { type AbortProvenance, captureAbortCaller, normalizeAbortReason } from "./abort.ts";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
@@ -144,6 +145,8 @@ export interface AgentOptions {
 	 * (`{ attribution: PI_ATTRIBUTION }`). Pass `{ attribution: null }` to send no attribution headers.
 	 */
 	identity?: ClientIdentity;
+	/** Called once for the first abort of each live run, after its signal is aborted. */
+	onAbort?: (provenance: AbortProvenance) => void;
 }
 
 class PendingMessageQueue {
@@ -180,6 +183,7 @@ class PendingMessageQueue {
 }
 
 type ActiveRun = {
+	id: string;
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
@@ -194,6 +198,7 @@ type ActiveRun = {
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
+	private readonly abortObservers = new Set<(provenance: AbortProvenance) => void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
 
@@ -260,6 +265,7 @@ export class Agent {
 		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
 		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
 		this.identity = runtimeOptions.identity;
+		if (runtimeOptions.onAbort) this.abortObservers.add(runtimeOptions.onAbort);
 	}
 
 	/**
@@ -275,6 +281,18 @@ export class Agent {
 	subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to abort provenance for live runs.
+	 *
+	 * Observers run after the active signal is aborted, in subscription order.
+	 * A throwing observer is isolated from the abort and from the other observers.
+	 * Returns a function that removes the observer.
+	 */
+	addAbortObserver(observer: (provenance: AbortProvenance) => void): () => void {
+		this.abortObservers.add(observer);
+		return () => this.abortObservers.delete(observer);
 	}
 
 	/**
@@ -346,9 +364,35 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
-	/** Abort the current run, if one is active. */
-	abort(): void {
-		this.activeRun?.abortController.abort();
+	/**
+	 * Abort the current run, if one is active.
+	 *
+	 * The first abort captures provenance and aborts the run signal without a
+	 * reason, so the signal keeps the standard `AbortError`. Later calls while
+	 * that run is live, and calls while idle, are no-ops. Observer errors never
+	 * escape and cannot veto cancellation.
+	 */
+	abort(reason?: string): void {
+		const activeRun = this.activeRun;
+		if (!activeRun || activeRun.abortController.signal.aborted) return;
+
+		const provenance: AbortProvenance = {
+			runId: activeRun.id,
+			reason: normalizeAbortReason(reason),
+			caller: captureAbortCaller(Agent.prototype.abort),
+			timestamp: new Date().toISOString(),
+		};
+
+		activeRun.abortController.abort();
+		for (const observer of this.abortObservers) {
+			try {
+				observer(provenance);
+			} catch (error) {
+				// An observer cannot veto cancellation or stop the observers after it. Drop the failure
+				// and keep notifying.
+				void error;
+			}
+		}
 	}
 
 	/**
@@ -524,7 +568,7 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = { id: globalThis.crypto.randomUUID(), promise, resolve: resolvePromise, abortController };
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;

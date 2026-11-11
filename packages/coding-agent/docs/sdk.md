@@ -69,6 +69,18 @@ A steering message enters after the current assistant turn and its tool calls. A
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
+`abort(reason?)` takes an optional diagnostic reason and defaults to `"sdk"`. Use a short machine token, never secrets or user content. Interactive, RPC, extension, and compaction call sites pass `"user"`, `"rpc"`, `"extension"`, and `"compaction"`; session lifecycle call sites pass `"session.quit"`, `"session.new"`, `"session.resume"`, and `"session.fork"`. `"session.dispose"` is recorded only when disposal cancels a live agent run, not when it tears down an idle session or a run that has not reached the agent yet. The reason only labels the recorded provenance; cancellation and the `AbortError` seen by tools are unchanged.
+
+## Abort diagnostics
+
+Aborting an active session writes a diagnostic record to `aborts.json` in the agent directory (`getAgentDir()`; `~/.pi/agent` by default, overridden by `PI_CODING_AGENT_DIR`). The file keeps the latest 20 records and is created with mode `0600`. An idle session writes nothing, and repeated aborts of the same run write at most one record.
+
+Each record holds the `timestamp`, the `reason` when known, the `runId` of the logical session run, `scope` (`"agent_request"`, `"between_requests"`, or `"before_settle"`), `version`, `sessionId`, `cwd`, and `pid`. When the abort interrupted a live low-level agent run, the record also includes that run's `requestRunId`; a direct `Agent` run aborted outside a session run uses its own run id for both fields. `caller` holds a bounded list of the abort call site's stack frames. `sessionLeafId` is a best-effort hint that can be present for in-memory sessions too, while `sessionFile` is present only for persisted sessions.
+
+Records include local filesystem paths, such as the working directory, the session file, and caller frame paths. They exclude conversation entries, model context, and provider payloads, and nothing is uploaded automatically. In-memory and `--no-session` sessions still write records, without a session file.
+
+Logging is best effort: a write failure never blocks or changes cancellation, and concurrent Pi processes can overwrite each other's records, so a missing record does not prove that no abort happened. Abort records are not correlated with crash reports; crash capture is unchanged.
+
 ## Subscribing to events
 
 Subscribe before prompting when the host needs streamed output:

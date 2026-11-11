@@ -272,6 +272,10 @@ const agent = new Agent({
     return shouldContinue(message, toolResults) ? { action: "continue" } : undefined;
   },
 
+  // Observe aborts of live runs with provenance (run id, optional reason, caller frames).
+  // There is no mutable onAbort property; use agent.addAbortObserver() for late registration.
+  onAbort: (provenance) => logAbort(provenance),
+
   // Custom thinking budgets for token-based providers
   thinkingBudgets: {
     minimal: 128,
@@ -371,9 +375,34 @@ agent.thinkingBudgets = {
 ### Control
 
 ```typescript
-agent.abort();           // Cancel current operation
+agent.abort();             // Cancel current operation
+agent.abort("user");       // Cancel with a diagnostic reason
 await agent.waitForIdle(); // Wait for completion
 ```
+
+### Abort provenance
+
+`abort(reason?)` accepts an optional short machine token for diagnostics, such as `"user"`, `"rpc"`, or `"compaction"`. The reason is metadata only: it must not contain secrets or user content, and it does not change cancellation, so tools and streams still observe the standard `AbortError` on `signal.reason`.
+
+Register `onAbort` when constructing the agent, or add an observer later, to receive an `AbortProvenance` after a live run's signal aborts:
+
+```typescript
+const agent = new Agent({
+  streamFn: models.streamSimple.bind(models),
+  onAbort: (provenance) => logAbort(provenance),
+});
+
+const unsubscribe = agent.addAbortObserver((provenance) => {
+  console.log(provenance.runId, provenance.reason, provenance.caller[0]);
+});
+unsubscribe();
+```
+
+`AbortProvenance` reports `runId` (a UUID unique to that run), the optional normalized `reason` (control characters replaced with spaces, trimmed, at most 200 characters; empty becomes `undefined`), `caller` (up to six calling frames, each at most 160 characters, nearest first), and a `timestamp`.
+
+Observers are called once per live run after its signal aborts, so a repeated abort of the same run does not notify again. `abort()` on an idle agent does nothing and notifies nobody. Observers are isolated: one that throws does not prevent cancellation or stop the others, and its error does not escape `abort()`.
+
+`onAbort` is a constructor option only; the agent has no mutable `onAbort` property. `addAbortObserver()` returns an unsubscribe function. The agent does not write provenance to the transcript or the filesystem.
 
 ### Events
 

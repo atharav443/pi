@@ -2101,7 +2101,7 @@ export class InteractiveMode {
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				this.restoreQueuedMessagesToEditor({ abort: true, abortReason: "extension" });
 			},
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
@@ -2397,7 +2397,7 @@ export class InteractiveMode {
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				this.restoreQueuedMessagesToEditor({ abort: true, abortReason: "extension" });
 			},
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
@@ -4927,13 +4927,17 @@ export class InteractiveMode {
 		}
 	}
 
-	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+	private restoreQueuedMessagesToEditor(options?: {
+		abort?: boolean;
+		abortReason?: string;
+		currentText?: string;
+	}): number {
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				void this.session.abort();
+				void this.session.abort(options.abortReason ?? "user");
 			}
 			return 0;
 		}
@@ -4943,7 +4947,7 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			void this.session.abort();
+			void this.session.abort(options.abortReason ?? "user");
 		}
 		return allQueued.length;
 	}
@@ -5811,7 +5815,7 @@ export class InteractiveMode {
 					// The user committed to navigating: stop the active response first.
 					if (this.session.isStreaming) {
 						this.restoreQueuedMessagesToEditor();
-						await this.session.abort();
+						await this.session.abort("user");
 					}
 
 					// Recheck after the dialogs and streaming abort, before replacing another operation's UI.
